@@ -222,6 +222,43 @@ It never leaves the server.
 
 ## 3. PowerShell tests
 
+### The easy way: run the script
+
+```powershell
+.\scripts\Test-Ingest.ps1
+```
+
+Runs (a) through (d) and prints a pass/fail summary. No functions to paste, so
+nothing breaks when you open a new terminal.
+
+```powershell
+.\scripts\Test-Ingest.ps1 -Test valid       # just (a)
+.\scripts\Test-Ingest.ps1 -Test duplicate   # just (b)
+.\scripts\Test-Ingest.ps1 -Test badkey      # just (c)
+.\scripts\Test-Ingest.ps1 -Test malformed   # just (d)
+
+.\scripts\Test-Ingest.ps1 -Key 'zlk_...' -Url 'https://your-app.vercel.app/api/ingest/lead'
+```
+
+If PowerShell refuses — *"running scripts is disabled on this system"* — either:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Test-Ingest.ps1
+```
+
+or allow local scripts once, for your user only:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+> **`The term 'Invoke-Ingest' is not recognized`** means you ran a test block
+> without the setup block that defines the function, or opened a new terminal —
+> pasted functions live only in the session that defined them. The script above
+> avoids this entirely.
+
+### The manual way
+
 Paste this setup block first. `Invoke-RestMethod` and `Invoke-WebRequest` both
 throw on any non-2xx, which makes testing a 401 or a 500 awkward, so this helper
 catches the error and returns the status and body either way.
