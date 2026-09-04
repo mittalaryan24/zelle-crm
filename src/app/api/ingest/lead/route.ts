@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { extractBearerToken, hashApiKey } from "@/lib/api-key";
+import { ConfigurationError } from "@/lib/env";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
 import { formatValidationErrors, ingestLeadSchema } from "./schema";
 
@@ -36,19 +37,57 @@ type ErrorCode =
   | "invalid_json"
   | "invalid_payload"
   | "method_not_allowed"
+  | "configuration_error"
   | "internal_error";
+
+/**
+ * Internal detail is echoed to the caller outside production only.
+ *
+ * In development, a 500 that says "an unexpected error occurred" and nothing
+ * else is close to useless — you are left correlating request ids against a
+ * terminal. In production the same detail is a liability: driver errors carry
+ * table names, column names and occasionally connection strings.
+ *
+ * `configuration_error` is exempt and always returned in full. "You did not
+ * fill in .env.local" contains no secrets and is the single most useful thing
+ * a developer can be told.
+ */
+const EXPOSE_INTERNAL_ERRORS = process.env.NODE_ENV !== "production";
 
 function errorResponse(
   status: number,
   code: ErrorCode,
   message: string,
   requestId: string,
-  details?: string[],
+  options: { details?: string[]; debug?: string } = {},
 ) {
+  const { details, debug } = options;
+
   return NextResponse.json(
-    { error: { code, message, ...(details ? { details } : {}) }, request_id: requestId },
+    {
+      error: {
+        code,
+        message,
+        ...(details ? { details } : {}),
+        ...(debug && EXPOSE_INTERNAL_ERRORS ? { debug } : {}),
+      },
+      request_id: requestId,
+    },
     { status, headers: { "X-Request-Id": requestId } },
   );
+}
+
+/**
+ * One-line headline before any structured detail.
+ *
+ * Node prints a multi-line object for the detail, and a stack trace runs to
+ * dozens of lines. Without a headline the actual cause scrolls off the top of
+ * the terminal and the failure reads as "no output at all" — which is exactly
+ * how this route's first real failure was reported.
+ */
+function logFailure(requestId: string, summary: string, detail?: unknown) {
+  console.error(`\n[ingest/lead] ✖ ${requestId} — ${summary}`);
+  if (detail !== undefined) console.error(detail);
 }
 
 export async function POST(request: NextRequest) {
@@ -86,15 +125,25 @@ export async function POST(request: NextRequest) {
       // A database failure while checking the key is a server problem, not an
       // authentication failure. Reporting it as 401 would send n8n chasing a
       // credential that is actually fine.
-      console.error("[ingest/lead] api key lookup failed", {
-        requestId,
-        error: apiKeyError.message,
+      logFailure(requestId, `api_keys lookup failed: ${apiKeyError.message}`, {
+        code: apiKeyError.code,
+        details: apiKeyError.details,
+        hint: apiKeyError.hint,
       });
       return errorResponse(
         500,
         "internal_error",
-        "Could not verify the API key. Retry shortly.",
+        "Could not verify the API key against the database.",
         requestId,
+        {
+          debug:
+            `${apiKeyError.message}` +
+            (apiKeyError.hint ? ` — hint: ${apiKeyError.hint}` : "") +
+            (apiKeyError.code === "42P01"
+              ? " — the api_keys table does not exist. Has migration " +
+                "20260905090400_api_keys_and_ingest.sql been applied?"
+              : ""),
+        },
       );
     }
 
@@ -140,13 +189,13 @@ export async function POST(request: NextRequest) {
 
     if (!parsed.success) {
       const details = formatValidationErrors(parsed.error);
-      console.warn("[ingest/lead] payload rejected", { requestId, details });
+      console.warn(`[ingest/lead] ⚠ ${requestId} — payload rejected`, details);
       return errorResponse(
         400,
         "invalid_payload",
         "Request body failed validation.",
         requestId,
-        details,
+        { details },
       );
     }
 
@@ -168,19 +217,40 @@ export async function POST(request: NextRequest) {
     });
 
     if (error) {
-      console.error("[ingest/lead] ingest_lead failed", {
+      // PGRST202 means PostgREST could not find the function with this exact
+      // name and parameter set — a signature mismatch between this call and
+      // migration 005, or a schema cache that has not picked the function up
+      // yet. Worth naming explicitly: the raw message is cryptic.
+      const signatureProblem = error.code === "PGRST202";
+
+      logFailure(
         requestId,
-        organizationId: apiKey.organization_id,
-        sourceMessageId: parsed.data.source_message_id,
-        code: error.code,
-        message: error.message,
-        details: error.details,
-      });
+        `ingest_lead() rpc failed [${error.code ?? "no code"}]: ${error.message}`,
+        {
+          organizationId: apiKey.organization_id,
+          sourceMessageId: parsed.data.source_message_id,
+          details: error.details,
+          hint: error.hint,
+        },
+      );
+
       return errorResponse(
         500,
         "internal_error",
         "The lead could not be saved. No partial data was written; the request can be retried safely.",
         requestId,
+        {
+          debug:
+            `[${error.code ?? "no code"}] ${error.message}` +
+            (error.details ? ` — ${error.details}` : "") +
+            (error.hint ? ` — hint: ${error.hint}` : "") +
+            (signatureProblem
+              ? " — PostgREST cannot find public.ingest_lead(p_key_hash text, " +
+                "p_payload jsonb). Check migration 20260905090400 ran, that " +
+                "EXECUTE is granted to service_role, and reload the schema " +
+                "cache (Dashboard → API Docs → Reload, or NOTIFY pgrst, 'reload schema')."
+              : ""),
+        },
       );
     }
 
@@ -243,19 +313,54 @@ export async function POST(request: NextRequest) {
       { status: 201, headers: { "X-Request-Id": requestId } },
     );
   } catch (caught) {
-    // Anything unforeseen. The message is logged but never returned — internal
-    // errors can carry connection strings, table names and other detail that
-    // does not belong in a response.
-    console.error("[ingest/lead] unhandled error", {
-      requestId,
-      error: caught instanceof Error ? caught.message : String(caught),
-      stack: caught instanceof Error ? caught.stack : undefined,
-    });
+    const message =
+      caught instanceof Error ? caught.message : String(caught);
+
+    // Misconfiguration is reported in full, in every environment. It names an
+    // environment variable and what to do about it — no secrets, and the
+    // alternative is watching someone debug an unedited .env.local for an hour.
+    if (caught instanceof ConfigurationError) {
+      logFailure(requestId, `CONFIGURATION ERROR — ${message}`);
+      return errorResponse(500, "configuration_error", message, requestId);
+    }
+
+    // supabase-js throws this from createClient() when the URL will not parse.
+    // In practice that means .env.local was copied from .env.example and never
+    // edited, so say so rather than leaving a cryptic library message.
+    if (/Invalid supabaseUrl/i.test(message)) {
+      const explained =
+        `${message} — NEXT_PUBLIC_SUPABASE_URL is not a usable URL. If .env.local ` +
+        `was copied from .env.example, replace the placeholders with the real ` +
+        `values from Supabase Dashboard → Settings → API, then restart the dev server.`;
+      logFailure(requestId, `CONFIGURATION ERROR — ${explained}`);
+      return errorResponse(500, "configuration_error", explained, requestId);
+    }
+
+    // A network-level failure reaching Supabase. Usually a wrong project ref,
+    // or no connectivity — not something a retry of the same request will fix.
+    if (/fetch failed|ENOTFOUND|ECONNREFUSED|getaddrinfo/i.test(message)) {
+      logFailure(requestId, `cannot reach Supabase: ${message}`, caught);
+      return errorResponse(
+        500,
+        "internal_error",
+        "Could not reach the Supabase project.",
+        requestId,
+        {
+          debug:
+            `${message} — check NEXT_PUBLIC_SUPABASE_URL points at a project ` +
+            `that exists and that this machine has network access.`,
+        },
+      );
+    }
+
+    logFailure(requestId, `unhandled ${caught instanceof Error ? caught.name : "error"}: ${message}`, caught);
+
     return errorResponse(
       500,
       "internal_error",
       "An unexpected error occurred. The request can be retried safely.",
       requestId,
+      { debug: message },
     );
   }
 }

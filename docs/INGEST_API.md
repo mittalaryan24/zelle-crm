@@ -219,10 +219,20 @@ It never leaves the server.
 
 ## 3. PowerShell tests
 
-Paste this setup block first. `Invoke-RestMethod` throws on any non-2xx, which
-makes testing a 401 awkward, so this helper catches the error and returns the
-status and parsed body either way — and works on both Windows PowerShell 5.1 and
-PowerShell 7.
+Paste this setup block first. `Invoke-RestMethod` and `Invoke-WebRequest` both
+throw on any non-2xx, which makes testing a 401 or a 500 awkward, so this helper
+catches the error and returns the status and body either way.
+
+It returns three things: `Status`, `Body` (parsed JSON) and `Raw` (the response
+text exactly as received). **`Raw` matters** — if the server returns an HTML
+error page rather than JSON, `Body` is null and only `Raw` shows you what
+happened. Always check `Raw` when `Body` is empty.
+
+> An earlier version of this helper relied on `$_.ErrorDetails.Message`, which
+> Windows PowerShell 5.1 does not reliably populate — so error responses came
+> back as `Body = $null` and looked like the server had returned nothing at all.
+> This version reads the response stream directly as a fallback. Verified on
+> PowerShell 5.1.
 
 ```powershell
 $IngestUrl = 'http://localhost:3000/api/ingest/lead'
@@ -234,20 +244,48 @@ function Invoke-Ingest {
     $headers = @{}
     if ($Key) { $headers['Authorization'] = "Bearer $Key" }
 
+    $status = 0
+    $raw    = $null
+
     try {
+        # Body sent as UTF-8 bytes so non-ASCII names survive the round trip.
         $r = Invoke-WebRequest -Uri $IngestUrl -Method Post -Headers $headers `
-             -ContentType 'application/json' -Body $Body -UseBasicParsing
-        [pscustomobject]@{ Status = [int]$r.StatusCode; Body = ($r.Content | ConvertFrom-Json) }
+             -ContentType 'application/json' `
+             -Body ([Text.Encoding]::UTF8.GetBytes($Body)) `
+             -UseBasicParsing -ErrorAction Stop
+        $status = [int]$r.StatusCode
+        $raw    = $r.Content
     }
     catch {
-        $status = 0
-        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-        $payload = $null
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
-            $payload = $_.ErrorDetails.Message | ConvertFrom-Json
+        if ($_.Exception.Response) {
+            try { $status = [int]$_.Exception.Response.StatusCode } catch {}
         }
-        [pscustomobject]@{ Status = $status; Body = $payload }
+        # PowerShell 7 usually fills this in.
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $raw = $_.ErrorDetails.Message
+        }
+        # PowerShell 5.1 usually does not, so read the stream ourselves.
+        if (-not $raw -and $_.Exception.Response) {
+            try {
+                $rs = $_.Exception.Response.GetResponseStream()
+                $rs.Position = 0
+                $sr  = New-Object System.IO.StreamReader($rs)
+                $raw = $sr.ReadToEnd()
+                $sr.Close()
+            } catch {
+                $raw = "<could not read response body: $($_.Exception.Message)>"
+            }
+        }
+        # No response at all — server down, wrong port, connection refused.
+        if (-not $raw) {
+            $raw = "<no response body; transport error: $($_.Exception.Message)>"
+        }
     }
+
+    $parsed = $null
+    if ($raw) { try { $parsed = $raw | ConvertFrom-Json } catch {} }
+
+    [pscustomobject]@{ Status = $status; Body = $parsed; Raw = $raw }
 }
 
 $Payload = @'
@@ -278,6 +316,7 @@ $Payload = @'
 $a = Invoke-Ingest -Key $GoodKey -Body $Payload
 $a.Status          # 201
 $a.Body | Format-List
+$a.Raw             # if Body is empty, this shows what actually came back
 ```
 
 ✅ Pass:
@@ -451,6 +490,39 @@ select content from activities
 ```
 
 Re-activate afterwards: `update users set is_active = true where organization_id = 'a0000000-…-000000000001';`
+
+---
+
+## Troubleshooting a 500
+
+Every 500 now returns an `error.code`, and outside production also an
+`error.debug` carrying the underlying message. The server prints a single
+headline line first — `[ingest/lead] ✖ <request-id> — <summary>` — so the cause
+is visible without scrolling past a stack trace.
+
+If `$a.Body` is empty, read `$a.Raw`. An HTML response there means the request
+never reached the route (wrong port, wrong path, server not running).
+
+| `error.code` | `error.debug` contains | Cause | Fix |
+|---|---|---|---|
+| `configuration_error` | "still contains the placeholder text" | `.env.local` was copied from `.env.example` and never edited | Fill in the real values, **restart `npm run dev`** |
+| `configuration_error` | "Invalid supabaseUrl" | URL malformed | Must be `https://<ref>.supabase.co`, no trailing slash |
+| `configuration_error` | "role is \"anon\", not \"service_role\"" | Anon key pasted into the service_role slot | Copy the `service_role` key — the two look nearly identical |
+| `configuration_error` | "does not look like a Supabase key" | Project URL, project ref or DB password in the key slot | Copy the `service_role` JWT |
+| `internal_error` | `[42P01] relation "api_keys" does not exist` | Migration 005 not applied | Run `20260905090400_api_keys_and_ingest.sql` |
+| `internal_error` | `[PGRST202]` | PostgREST cannot find `ingest_lead` | Check migration 005 ran and `EXECUTE` is granted to `service_role`; reload the schema cache |
+| `internal_error` | "Could not reach the Supabase project" | DNS/network, or a project ref that does not exist | Check the URL and connectivity |
+| `internal_error` | `[23514] violates check constraint` | Payload passed Zod but not a database CHECK | Read the constraint name in `debug` |
+
+**Restarting after editing `.env.local` is not optional.** Next.js reads `.env`
+files once at startup; editing one while the dev server runs changes nothing,
+and you will keep seeing the same error and assume the fix did not work.
+
+`error.debug` appears only when `NODE_ENV !== "production"`. On Vercel the field
+is omitted and the detail goes to the server logs instead, since driver errors
+can carry table and column names. `configuration_error` is the exception — its
+message names an environment variable, never a secret, so it is always returned
+in full.
 
 ---
 
