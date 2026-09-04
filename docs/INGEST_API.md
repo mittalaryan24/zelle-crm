@@ -208,7 +208,10 @@ That returns the raw key **once** — copy it immediately, it cannot be recovere
 ## 2. Start the server
 
 ```powershell
-cp .env.example .env.local     # then fill in the three values
+# -NoClobber so this cannot overwrite an .env.local you have already filled in.
+# Plain `Copy-Item` (and `cp`) overwrite silently, with no undo — and .env.local
+# is gitignored, so there is no copy in git to restore from.
+Copy-Item .env.example .env.local -NoClobber
 npm run dev
 ```
 
