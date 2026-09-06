@@ -34,11 +34,13 @@ and is the one that actually counts.**
 
 ## 0. Apply the migrations
 
-- [ ] Apply all four files, in filename order:
+- [ ] Apply all six files, in filename order:
       `20260905090000_initial_schema.sql`,
       `20260905090100_tenancy_helpers.sql`,
       `20260905090200_rls_policies.sql`,
-      `20260905090300_auth_provisioning.sql`
+      `20260905090300_auth_provisioning.sql`,
+      `20260905090400_api_keys_and_ingest.sql`,
+      `20260906120000_staff_lead_scoping.sql`
       — via `supabase db push`, or by pasting each into the SQL editor in order.
 - [ ] Each one completes with no error. If one fails, stop; later files depend on it.
 - [ ] Confirm your Postgres is **15 or newer** — the `ON DELETE SET NULL (column)`
@@ -48,6 +50,57 @@ and is the one that actually counts.**
       ```
 - [ ] Dashboard → **Advisors → Security**: no `rls_disabled_in_public` and no
       `function_search_path_mutable` warnings on our tables/functions.
+
+---
+
+## 0b. What migration 006 changed, and what it invalidates here
+
+Migration `20260906120000_staff_lead_scoping.sql` **narrows the `leads` SELECT
+and UPDATE policies**, so parts of this document written against migration 003
+now describe the old behaviour.
+
+Migration 003 said, deliberately: *"Admin and staff are identical here by
+design."* That held while the only client was the ingestion route, which uses the
+service role and bypasses RLS. Stage 3 put a browser in front of this data, and
+a staff user's JWT could then read every lead in their organization — through
+devtools or a direct PostgREST call, whatever the UI chose to draw.
+
+The rule is now:
+
+| role  | can SELECT / UPDATE                                |
+|-------|----------------------------------------------------|
+| admin | every lead in their organization *(unchanged)*     |
+| staff | only leads where `assigned_to` = them *(narrowed)* |
+
+`conversations` and `activities` inherit it by reference — their policies test
+"can you see the parent lead?" rather than restating the rule — so a transcript
+or note history cannot be read for a lead you cannot open.
+
+**Tenant isolation is unchanged.** Every check in §2 and §3 that asserts Org A
+cannot see Org B still holds and still passes.
+
+**What to expect that differs from the text below:** any step that logs in as a
+staff user (Sam or Nadia) and expects to see *both* of their org's leads will now
+see only the one assigned to them. That is the new correct answer, not a
+regression.
+
+Two scripts verify this from the client side, using the anon key and a real user
+JWT — the same path the browser takes:
+
+```powershell
+node scripts/check-rls.mjs      # who can read what
+node scripts/check-writes.mjs   # who can write what
+```
+
+Expected from `check-rls.mjs` once 006 is applied:
+
+```
+Priya  (Org A, admin)  alpha=YES gamma=YES transcript=YES cross_org=no
+Sam    (Org A, staff)  alpha=YES gamma=no  transcript=YES cross_org=no
+```
+
+`gamma=WIDE` for Sam means 006 has not been applied — he is seeing an unassigned
+lead that should be admin-only.
 
 ---
 

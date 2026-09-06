@@ -2,10 +2,11 @@
 
 The endpoint n8n calls once the AI bot has qualified a lead.
 
-**Not yet executed.** Migration 005 has never been run and the endpoint has
-never served a request. It compiles and builds cleanly (`tsc --noEmit` and
-`next build` both pass), but everything below is unverified against a live
-database. Work through the tests here before pointing n8n at it.
+**Verified end to end on 2026-09-05.** Migration 005 is applied and the route
+has served live requests against the Supabase project. All six checks in
+`scripts/Test-Ingest.ps1` pass: create (201), idempotent resend (200), wrong key
+and missing key (401), and a malformed payload (400) with per-field detail.
+Round-robin assignment was observed alternating between the two active users.
 
 ---
 
@@ -274,7 +275,34 @@ happened. Always check `Raw` when `Body` is empty.
 > This version reads the response stream directly as a fallback. Verified on
 > PowerShell 5.1.
 
+> ### Set `$IngestUrl` to the port your dev server actually printed
+>
+> `next dev` moves to 3001, 3002... when 3000 is already taken, and it prints
+> the port it settled on. Testing against 3000 out of habit then means testing
+> **whatever else took port 3000** — which returns its own errors, in its own
+> format, and logs to its own terminal, not the one running `npm run dev`.
+>
+> The symptom is a 500 with an empty body and a completely silent dev-server
+> terminal, which reads exactly like a bug in this route. It is not one.
+>
+> Every response this route produces carries an `X-Ingest-Route: lead` header.
+> The helper below checks for it and says so when it is missing, so a reply from
+> the wrong server can never again be mistaken for a broken handler.
+>
+> To confirm which port is serving the route before testing anything:
+>
+> ```powershell
+> 3000,3001,3002,3003 | ForEach-Object {
+>     $u = "http://localhost:$_/api/ingest/lead"
+>     $h = $null
+>     try   { $h = (Invoke-WebRequest $u -Method Options -UseBasicParsing -TimeoutSec 2).Headers['X-Ingest-Route'] }
+>     catch { try { $h = $_.Exception.Response.Headers['X-Ingest-Route'] } catch {} }
+>     "{0,-45} {1}" -f $u, $(if ($h) { 'THIS IS THE INGEST ROUTE' } else { 'not our app (or nothing listening)' })
+> }
+> ```
+
 ```powershell
+# Use the port `npm run dev` printed - NOT 3000 by reflex. See the warning above.
 $IngestUrl = 'http://localhost:3000/api/ingest/lead'
 $GoodKey   = 'zlk_local_test_only_00000000000000000000'
 
@@ -286,6 +314,7 @@ function Invoke-Ingest {
 
     $status = 0
     $raw    = $null
+    $fromUs = $false
 
     try {
         # Body sent as UTF-8 bytes so non-ASCII names survive the round trip.
@@ -295,10 +324,13 @@ function Invoke-Ingest {
              -UseBasicParsing -ErrorAction Stop
         $status = [int]$r.StatusCode
         $raw    = $r.Content
+        $fromUs = [bool]$r.Headers['X-Ingest-Route']
     }
     catch {
         if ($_.Exception.Response) {
             try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+            # Absent = this reply did not come from our handler at all.
+            try { $fromUs = [bool]$_.Exception.Response.Headers['X-Ingest-Route'] } catch {}
         }
         # PowerShell 7 usually fills this in.
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
@@ -308,7 +340,11 @@ function Invoke-Ingest {
         if (-not $raw -and $_.Exception.Response) {
             try {
                 $rs = $_.Exception.Response.GetResponseStream()
-                $rs.Position = 0
+                # Only rewind if it is rewindable: 5.1 returns a seekable
+                # SyncMemoryStream for small replies but a forward-only
+                # ConnectStream for larger ones, and setting Position on that
+                # throws - which loses the body all over again.
+                if ($rs.CanSeek) { $rs.Position = 0 }
                 $sr  = New-Object System.IO.StreamReader($rs)
                 $raw = $sr.ReadToEnd()
                 $sr.Close()
@@ -325,7 +361,12 @@ function Invoke-Ingest {
     $parsed = $null
     if ($raw) { try { $parsed = $raw | ConvertFrom-Json } catch {} }
 
-    [pscustomobject]@{ Status = $status; Body = $parsed; Raw = $raw }
+    if (-not $fromUs -and $status -ne 0) {
+        Write-Host "!! Status $status came from something that is NOT /api/ingest/lead" -ForegroundColor Red
+        Write-Host "   (no X-Ingest-Route header). Check the port in `$IngestUrl." -ForegroundColor Red
+    }
+
+    [pscustomobject]@{ Status = $status; Body = $parsed; Raw = $raw; FromIngestRoute = $fromUs }
 }
 
 $Payload = @'

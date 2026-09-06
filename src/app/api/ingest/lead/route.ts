@@ -73,7 +73,7 @@ function errorResponse(
       },
       request_id: requestId,
     },
-    { status, headers: { "X-Request-Id": requestId } },
+    { status, headers: { "X-Request-Id": requestId, "X-Ingest-Route": "lead" } },
   );
 }
 
@@ -285,7 +285,7 @@ export async function POST(request: NextRequest) {
           message: "A lead with this source_message_id already exists for this organization.",
           request_id: requestId,
         },
-        { status: 200, headers: { "X-Request-Id": requestId } },
+        { status: 200, headers: { "X-Request-Id": requestId, "X-Ingest-Route": "lead" } },
       );
     }
 
@@ -310,7 +310,7 @@ export async function POST(request: NextRequest) {
         lead_status: result.lead_status,
         request_id: requestId,
       },
-      { status: 201, headers: { "X-Request-Id": requestId } },
+      { status: 201, headers: { "X-Request-Id": requestId, "X-Ingest-Route": "lead" } },
     );
   } catch (caught) {
     const message =
@@ -369,13 +369,22 @@ export async function POST(request: NextRequest) {
  * Without these, Next answers any other verb with a bare 405 and an empty body,
  * which is confusing to debug from n8n. This returns the same error envelope as
  * every other failure.
+ *
+ * It also logs. A silent 405 looks identical from the client to a 500 from some
+ * other process on the port you meant to use, and "nothing in the dev server
+ * terminal" is the signal that tells you the request never arrived here at all.
+ * Every response this file produces should leave a trace on both sides.
  */
-async function methodNotAllowed() {
+function methodNotAllowed(request: NextRequest) {
   const requestId = randomUUID();
+  logFailure(
+    requestId,
+    `${request.method} is not allowed on this endpoint; only POST is`,
+  );
   return errorResponse(
     405,
     "method_not_allowed",
-    "This endpoint only accepts POST.",
+    `This endpoint only accepts POST. Received ${request.method}.`,
     requestId,
   );
 }
@@ -384,3 +393,34 @@ export const GET = methodNotAllowed;
 export const PUT = methodNotAllowed;
 export const PATCH = methodNotAllowed;
 export const DELETE = methodNotAllowed;
+
+/**
+ * HEAD and OPTIONS are deliberately NOT methodNotAllowed.
+ *
+ * They are the two verbs a probe uses, and answering them is what makes "is the
+ * ingest route actually on this port?" a question you can answer in one command.
+ * Both carry X-Request-Id and X-Ingest-Route, so a caller can tell a response
+ * from this route apart from a response from whatever else is listening — which
+ * is precisely the confusion that a dev-server port auto-switch creates.
+ */
+export async function HEAD() {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      "X-Request-Id": randomUUID(),
+      "X-Ingest-Route": "lead",
+      Allow: "POST, HEAD, OPTIONS",
+    },
+  });
+}
+
+export async function OPTIONS() {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      "X-Request-Id": randomUUID(),
+      "X-Ingest-Route": "lead",
+      Allow: "POST, HEAD, OPTIONS",
+    },
+  });
+}

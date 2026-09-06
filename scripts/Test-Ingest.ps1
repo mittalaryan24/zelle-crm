@@ -32,6 +32,10 @@
 .EXAMPLE
     .\scripts\Test-Ingest.ps1 -Key 'zlk_...' -Url 'https://your-app.vercel.app/api/ingest/lead'
 
+    With no -Url, the script probes localhost ports 3000-3003 and uses the first
+    one that is actually serving this route (identified by the X-Ingest-Route
+    response header, not merely by something answering on the port).
+
 .NOTES
     If PowerShell refuses to run this file ("running scripts is disabled on this
     system"), either run it as:
@@ -47,7 +51,14 @@ param(
 
     [string]$Key = 'zlk_local_test_only_00000000000000000000',
 
-    [string]$Url = 'http://localhost:3000/api/ingest/lead'
+    # Empty by default: the port is DISCOVERED rather than assumed. `next dev`
+    # silently moves to 3001, 3002... when 3000 is taken, and testing against a
+    # hardcoded 3000 then means testing whatever else grabbed that port — which
+    # answers with its own errors, in its own format, and logs to its own
+    # terminal. That failure mode reads exactly like "our route returned a 500
+    # with no body and logged nothing", and it has cost real debugging time.
+    # Pass -Url explicitly to skip discovery (required for a deployed URL).
+    [string]$Url = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,8 +79,9 @@ function Invoke-Ingest {
     $headers = @{}
     if ($ApiKey) { $headers['Authorization'] = "Bearer $ApiKey" }
 
-    $status = 0
-    $raw    = $null
+    $status  = 0
+    $raw     = $null
+    $fromUs  = $false
 
     try {
         $r = Invoke-WebRequest -Uri $Endpoint -Method Post -Headers $headers `
@@ -78,10 +90,16 @@ function Invoke-Ingest {
              -UseBasicParsing -ErrorAction Stop
         $status = [int]$r.StatusCode
         $raw    = $r.Content
+        $fromUs = [bool]$r.Headers['X-Ingest-Route']
     }
     catch {
         if ($_.Exception.Response) {
             try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+            # The route stamps this on EVERY response it produces, success or
+            # failure. Its absence means the reply came from something that is
+            # not this route: another app on the port, or Next's own HTML error
+            # page from a module that failed to load before the handler ran.
+            try { $fromUs = [bool]$_.Exception.Response.Headers['X-Ingest-Route'] } catch {}
         }
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
             $raw = $_.ErrorDetails.Message
@@ -89,7 +107,12 @@ function Invoke-Ingest {
         if (-not $raw -and $_.Exception.Response) {
             try {
                 $rs = $_.Exception.Response.GetResponseStream()
-                $rs.Position = 0
+                # Only rewind a stream that can be rewound. PowerShell 5.1 hands
+                # back a seekable SyncMemoryStream for small buffered replies but
+                # a forward-only ConnectStream for larger or chunked ones, and
+                # setting Position on that throws — losing the body and making a
+                # perfectly informative error look like an empty response.
+                if ($rs.CanSeek) { $rs.Position = 0 }
                 $sr  = New-Object System.IO.StreamReader($rs)
                 $raw = $sr.ReadToEnd()
                 $sr.Close()
@@ -106,7 +129,37 @@ function Invoke-Ingest {
     $parsed = $null
     if ($raw) { try { $parsed = $raw | ConvertFrom-Json } catch {} }
 
-    [pscustomobject]@{ Status = $status; Body = $parsed; Raw = $raw }
+    [pscustomobject]@{
+        Status        = $status
+        Body          = $parsed
+        Raw           = $raw
+        FromIngestRoute = $fromUs
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Where is the server?
+# -----------------------------------------------------------------------------
+# Answers "is /api/ingest/lead being served here?" without side effects, using
+# the OPTIONS probe the route exposes. A plain "is the port open?" check is not
+# good enough — the whole problem is that SOMETHING is usually listening.
+function Test-IngestEndpoint {
+    param([string]$Endpoint)
+    try {
+        $r = Invoke-WebRequest -Uri $Endpoint -Method Options -UseBasicParsing `
+             -TimeoutSec 3 -ErrorAction Stop
+        return [bool]$r.Headers['X-Ingest-Route']
+    } catch {
+        try { return [bool]$_.Exception.Response.Headers['X-Ingest-Route'] } catch { return $false }
+    }
+}
+
+function Find-IngestUrl {
+    foreach ($port in 3000, 3001, 3002, 3003) {
+        $candidate = "http://localhost:$port/api/ingest/lead"
+        if (Test-IngestEndpoint $candidate) { return $candidate }
+    }
+    return $null
 }
 
 # -----------------------------------------------------------------------------
@@ -128,6 +181,17 @@ function Write-Result {
     Write-Host "$mark $Label" -ForegroundColor $color
     Write-Host "       expected $Expected, got $($Response.Status)"
 
+    # The single most useful line in this script when things are confusing.
+    # A status with no X-Ingest-Route header did not come from our handler, so
+    # nothing about it — not the code, not the body, not the absence of a body,
+    # not the silent dev-server terminal — says anything about our code.
+    if (-not $Response.FromIngestRoute -and $Response.Status -ne 0) {
+        Write-Host "       !! This response did NOT come from /api/ingest/lead." -ForegroundColor Red
+        Write-Host "          It has no X-Ingest-Route header, so it came from another" -ForegroundColor Red
+        Write-Host "          process on this port, or from Next's own error page before" -ForegroundColor Red
+        Write-Host "          the handler ran. Check the port your dev server printed." -ForegroundColor Red
+    }
+
     if ($Response.Body) {
         if ($Response.Body.error) {
             Write-Host "       code    : $($Response.Body.error.code)" -ForegroundColor Yellow
@@ -147,12 +211,20 @@ function Write-Result {
             Write-Host "       status      : $($Response.Body.status)"
             Write-Host "       duplicate   : $($Response.Body.duplicate)"
             Write-Host "       lead_id     : $($Response.Body.lead_id)"
-            if ($null -ne $Response.Body.assigned_to) {
-                Write-Host "       assigned_to : $($Response.Body.assigned_to)"
-            } else {
-                Write-Host "       assigned_to : (null - no active users in this org)" -ForegroundColor Yellow
+
+            # Only the 'created' response carries assignment fields. A duplicate
+            # writes nothing, so it has no assigned_to to report - and printing
+            # "(null - no active users in this org)" there is simply false. That
+            # is the kind of confidently wrong diagnostic that sends someone
+            # looking for a staffing problem that does not exist.
+            if ($Response.Body.status -eq 'created') {
+                if ($null -ne $Response.Body.assigned_to) {
+                    Write-Host "       assigned_to : $($Response.Body.assigned_to)"
+                } else {
+                    Write-Host "       assigned_to : (null - no active users in this org)" -ForegroundColor Yellow
+                }
+                Write-Host "       lead_status : $($Response.Body.lead_status)"
             }
-            Write-Host "       lead_status : $($Response.Body.lead_status)"
         }
         Write-Host "       request_id  : $($Response.Body.request_id)" -ForegroundColor DarkGray
     }
@@ -202,6 +274,28 @@ $malformed = '{"channel":"telegram","source":"manychat","lead":{},"ai_qualificat
 # -----------------------------------------------------------------------------
 # Run
 # -----------------------------------------------------------------------------
+if (-not $Url) {
+    Write-Host ""
+    Write-Host "No -Url given; looking for the dev server..." -ForegroundColor DarkGray
+    $Url = Find-IngestUrl
+
+    if (-not $Url) {
+        Write-Host ""
+        Write-Host "Could not find /api/ingest/lead on localhost ports 3000-3003." -ForegroundColor Red
+        Write-Host "Start it with 'npm run dev', note the port it prints (it moves off" -ForegroundColor Red
+        Write-Host "3000 when that port is taken), then pass it explicitly:" -ForegroundColor Red
+        Write-Host "    .\scripts\Test-Ingest.ps1 -Url 'http://localhost:3001/api/ingest/lead'" -ForegroundColor Red
+        exit 1
+    }
+}
+elseif (-not (Test-IngestEndpoint $Url)) {
+    # Not fatal: an explicit -Url is the user's decision, and a deployment
+    # behind a proxy that strips headers is a legitimate reason to see this.
+    Write-Host ""
+    Write-Host "Warning: $Url did not identify itself as the ingest route." -ForegroundColor Yellow
+    Write-Host "Anything that answers may not be this app. Continuing anyway." -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "POST $Url" -ForegroundColor Cyan
 Write-Host "key  $($Key.Substring(0, [Math]::Min(12, $Key.Length)))..." -ForegroundColor DarkGray
